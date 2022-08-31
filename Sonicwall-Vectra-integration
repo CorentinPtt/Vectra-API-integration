@@ -1,0 +1,373 @@
+# SonicOS API script does the following:
+# Log in
+# Pull site to site VPN Policies
+# Edit each policy to enable the "Disable IPsec Anti-Replay" option.
+# Push the change back to SonicOS
+# Commit the changes#
+#
+
+# Notes:
+# anti_replay will be True in VPN config if the "Disable IPsec Anti-Replay" is unchecked/disabled in the GUI.
+# anti_replay will be False in VPN config if the "Disable IPsec Anti-Replay" is checked/enabled in the GUI.
+
+
+# Imports
+#from tkinter import FALSE
+try: 
+	from genericpath import exists
+	import requests
+	import re
+	import json
+	import base64
+	import urllib3
+	import logging
+	import time
+	import getpass
+	from vat.vectra import VectraClient
+	from urllib3 import exceptions
+	from collections import OrderedDict
+except ImportError as error:
+    print("Missing import requirements: %s\n" % str(error))
+    exit()
+
+# On file
+logging.basicConfig(filename='symantec-sync.log', format='%(asctime)s %(message)s', datefmt='%m/%d/%Y %I:%M:%S %p', level=logging.ERROR)
+
+# Firewall IP/port for SonicOS API
+#fw = input("Enter the target firewall URL and port (Example: https://192.168.0.3:450): ")
+#admin_username = input("Enter the management username: ")
+#admin_password = getpass.getpass("Enter your administrator password: ")
+
+fw = "https://192.168.1.100:443"
+admin_username = "admin"
+admin_password = "password"
+
+# Hide the certificate warnings.
+urllib3.disable_warnings(exceptions.InsecureRequestWarning)
+
+
+# Good headers to use with SonicOS API.
+good_headers = OrderedDict([
+	('Accept', 'application/json'),
+	('Content-Type', 'application/json'),
+	('Accept-Encoding', 'application/json'),
+	('charset', 'UTF-8')])
+
+
+# Headers to use for authentication.
+# Not used right now, but kept for my own notes.
+#auth_headers_backup = OrderedDict([
+#	('Accept', 'application/json'),
+#	('Content-Type', 'application/json'),
+#	('Accept-Encoding', 'application/json'),
+#	('charset', 'UTF-8'),
+#	('Authorization', 'Basic dddddddddddddddddddddddddd')])
+
+class Vectra:
+	
+	def __init__(self, host, key, verify=False):
+		self.key = key
+		self.host = "https://" + host
+		self.vac = VectraClient(url=self.host, token=self.key, verify=False)
+
+	def get_scored_hosts(self, min_threat=50, min_certainty=50):
+		"""
+        Get a dict of all hosts matching the threat and certainty criteria
+        Criteria have to be read as "OR"
+        Return is a dict where the key is the unique host ID and the value is the host object
+        """
+		hosts = {}
+		r = self.vac.get_all_hosts(threat_gte=min_threat, certainty_gte=min_certainty)
+		for page in r:
+			for threat_based_host in page.json()['results']:
+				hosts[threat_based_host['id']] = threat_based_host     
+		return hosts
+
+
+# Print response information
+def print_response_info(resp):
+	print("\n========================")
+	print("Req Headers", resp.request.headers)
+	print("Request:", resp.request, "--> Status Code:", resp.status_code, resp.reason)
+	print("Headers:", resp.headers)
+#	print("Text:", f"Type {type(resp.content)}", resp.content)
+	print("JSON:", f"Type {type(resp.json())}", resp.json())
+#	resp_dict = resp.json()
+	print("========================\n")
+
+# Encode credentials
+def encoded_credentials(user_name, password):
+	user_name = bytes(user_name, 'utf-8')
+	password = bytes(password, 'utf-8')
+	encoded_credentials = base64.b64encode(user_name + b":" + password)
+	encoded_credentials = encoded_credentials.decode('utf-8')
+	return encoded_credentials
+
+# Create the admin session and return a session object for later use.
+def create_admin_session(firewall, admin_user, admin_password):
+	# Headers
+	auth_headers = OrderedDict([
+		('Accept', 'application/json'),
+		('Content-Type', 'application/json'),
+		('Accept-Encoding', 'application/json'),
+		('charset', 'UTF-8'),
+		('Authorization', f'Basic {encoded_credentials(admin_user, admin_password)}')])
+
+	# Create a session and POST a login.
+	session = requests.Session()
+	auth_resp = session.post(firewall + '/api/sonicos/auth', headers=auth_headers, verify=False)
+	print_response_info(auth_resp)
+
+	# Deal with configuration mode
+	if auth_resp.json()['status']['info'][0]['config_mode'] == "Yes" :
+		print ("Configuration Mode")
+	else:
+		print ("Not configuration mode: Change access right" )
+		#is_config = 
+		force_config_mode(session)
+		if auth_resp.json()['status']['info'][0]['config_mode'] == "Yes" :
+			print ("Configuration Mode Solved")
+		else:
+			print("Issue with configuration mode")
+
+	return session
+
+# Get all ipv4 policies
+def get_ipv4_policies(session):
+	resp = session.get(fw + '/api/sonicos/security-policies/ipv4', headers=good_headers, verify=False)
+	return(resp.json())
+
+# Force the account to be in config mode 
+def force_config_mode(session):
+	resp = session.post(fw + '/api/sonicos/config-mode', headers=good_headers, verify=False)
+	return(resp.json())
+
+# Post new ipv4 policy
+def post_ipv4_policy(session, name):
+
+	json_data = {
+		'security_policies': [
+			{
+				'ipv4': {
+					'uuid': 'null',
+					'name': name,
+					'enable': True,
+					'priority': {
+						'manual': 1,
+					},
+					'comment': 'testing implementation of rule from script into sonicos api ruleset',
+					'from': 'any',
+					'to': 'any',
+					'source': {
+						'address': {'group' : 'Vectra'}, #'any' : True
+						'port': {'any': True},
+					},
+					'destination': {
+						'address': {'any': True}, #true
+
+					},
+					'service': {'any': True},
+					'users': {'all': True},
+					'match_operation': 'or',
+					'application': {'any': True},
+					'and_all_matched_applications': False,
+					'web_category': {'any': True},
+					'url_list': {'any': True},
+					'custom_match': {'any': True},
+					'country': {'any': True},
+					'schedule': {'always_on': True},
+					'action': 'allow',
+					'action_profile': 'Default Profile',
+					'ticket': {
+						'tag1': 'test',
+						'tag2': 'rule',
+						'tag3': 'script',
+					
+					},
+				},
+			},
+		],
+	}
+
+	response = session.post(fw + '/api/sonicos/security-policies/ipv4', headers=good_headers, json=json_data, verify=False)
+	return (response)
+
+# Delete policy
+def api_delete_policy(session, uuid):
+	r = requests.delete(fw + '/api/sonicos/security-policies/ipv4/uuid/' + uuid, headers=good_headers, verify=False)
+	response = r.json()
+	print('\nDelete done :', r.json())
+	return response
+
+# Commit all pending changes
+def commitPendingChanges(session):
+	# Commit all pending changes in config (probably means any other type of changes aside rules aswell)
+	controller = 'config/pending'
+	response = session.post(fw + '/api/sonicos/' +controller, headers=good_headers, verify=False)
+	print_response_info(response)
+	return (response)
+
+# Delete address-object
+def api_delete_group(session, name):
+	r = requests.delete(fw + '/api/sonicos/address-objects/ipv4/name/' + name, headers=good_headers, verify=False)
+	response = r.json()
+	print('\nDelete done :', r.json())
+	return response
+
+# Get all ipv4 address groups 
+def get_ipv4_address_objects_groups(session):
+    resp = session.get(fw + '/api/sonicos/address-objects/ipv4', headers=good_headers, verify=False)
+    return(resp.json())
+
+# Search in all groups for needed 'Vectra' group 
+def search_create_vectra_group(session, name, ip, gname):
+	address_objects = get_ipv4_address_objects_groups(session)
+	x=0
+	# checks if group exists
+	for groups in address_objects ['address_objects'] :
+		print (groups['ipv4'])
+		if groups['ipv4']['name'] == name:
+			x+=1
+
+	# if group exists make sure it is properly configured
+	if x >= 1:
+		print('\nThe vectra group exists. Will now check if properly configured.')
+		search_ip(session, ip, gname)
+	#in case group doesn't exist -> create it
+	else:
+		print('\nThe vectra group does not exist\nCreation of group to be implemented')
+		creation_and_check_groups(session, name, ip, gname)
+	
+
+# Searching for ip address in groups, if it doesn't we need to create policy / group containing it
+def search_ip(session, ip, name):
+	address_objects = get_ipv4_address_objects_groups(session)
+	#x=0
+	# Search if "Vectra" policy exists. If policy does not exist: Create policy.
+	for groups in address_objects ['address_objects'] :
+		if 'host' in groups['ipv4']:
+			if 'ip' in groups['ipv4']['host']:
+				if groups['ipv4']['host']['ip'] == ip and groups['ipv4']['name'] == name: 
+					print (groups['ipv4']['host']['ip'])
+					print('\nGroup exists and is properly configured\n')
+					#x+=1
+					return True
+	
+	#if x != 1:
+		# print('\nGroup is not properly configured. \nDeleting existing group and calling group creation method.\n')
+		# creation_and_check_groups(session)
+		# print('\nGroup created and configured. \nChecking if properly done.\n')
+		# search_create_vectra_group(session)
+
+def creation_and_check_groups(session, name, ip, gname):
+	print('\nThe vectra group does not currently exist\nCreation of group to be implemented')
+	createtest = create_vectra_group(session, name, ip)
+	print('\nCreation done :\n', createtest.json())
+	
+	commitPendingChanges(session)
+		
+	print('\nGroup created and commited. \nChecking if properly done.\n')
+	search_create_vectra_group(session, name, ip, gname)
+
+# Vectra group creation method 
+def create_vectra_group(session, name, ip):
+	
+    json_data = {
+        'address_objects': [
+			{
+            	'ipv4': {
+                	'name': name,
+                  	'uuid': "",
+                	'zone': "LAN",
+                	'host': {
+                    	'ip': ip,
+                	},
+				},
+            },
+        ],
+    }
+
+    response = session.post(fw + '/api/sonicos/address-objects/ipv4', headers=good_headers, json=json_data, verify=False)
+    return (response)
+
+
+def main():
+
+	# Create the session
+	session = create_admin_session(fw, admin_username, admin_password)
+
+	uri = "demo.vectra.io"
+	token = "4fe6f3a9defadebe696725b074009f500680e2e0"
+
+	policies = get_ipv4_policies(session)
+	for policy in policies [
+		'security_policies']:
+		print(policy)
+		exit()
+
+	vectra = Vectra(uri, token)
+	hosts = vectra.get_scored_hosts(50,50)
+	for host in hosts:
+		print("name: %s, ip: %s" % (hosts[host]["name"], hosts[host]["ip"])) 
+		
+		print('\n\nCreating group for new threat\n\n')
+		searchgroupname = (hosts[host]["name"])
+		searchip = (hosts[host]["ip"])
+		searchgrpname = (hosts[host]["name"])
+		search_create_vectra_group(session, searchgroupname, searchip, searchgrpname)
+
+		response = post_ipv4_policy(session, hosts[host]["name"])
+		print ('\n\nNew Rule status : \n', response.json())
+
+		exit()
+
+
+	############################################DELETE######################################################
+	
+	# deletegroupname = 'IPtest'
+	# # api_delete(session, deletegroupname)
+
+	# # If suppression needed, go into delete function
+	# x = input('Do you wish to delete an existing group? (y/n)')
+	# if (x == 'y') :
+	# 	api_delete_group(session, deletegroupname)
+	# 	commitPendingChanges(session)
+	# else :
+	# 	print('No deletion needed...\nExiting')
+	
+	##########################################OBJECT GROUPS#################################################
+
+	# Get Address Object groups 
+	# print('\n\n\n\nSonicwall Address Objects Groups :\n')
+	# searchgroupname = 'VectraTest'
+	# searchip = '192.16.161.131'
+	# searchgrpname = 'VectraTest'
+	# search_create_vectra_group(session, searchgroupname, searchip, searchgrpname)
+
+	###########################################POLICIES#####################################################
+
+	# Get Policies
+	# policies = get_ipv4_policies(session)
+	# policyname = 'test_script2'
+	# for policy in policies [
+	# 	'security_policies']:
+	# 	print(policy['ipv4']['name'])
+	# 	if policy['ipv4']['name'] == policyname:
+	# 		print (policy['ipv4']['uuid'])
+			# api_delete_policy(policy['ipv4']['uuid'])
+	# Change policies
+	# name = 'test_script3'
+	# response = post_ipv4_policy(session, name)
+	# print ('\n\nNew Rule status : \n', response.json())
+
+	########################################COMMIT CHANGES##################################################
+
+	# After changes are made, commit them.
+	commitPendingChanges(session)
+
+	
+
+# If program is launched directly
+if __name__ == "__main__":
+	main()
+
